@@ -4,6 +4,10 @@ Drive [Devin CLI](https://devin.ai) from Telegram. Start sessions, follow
 them live, approve commands with a tap, interrupt, switch modes: all from
 your phone, while the agent keeps working on your machine.
 
+<p align="center">
+  <img src="docs/demo.gif" width="320" alt="A Devin session driven from Telegram: instruction, permission prompt, tap to allow, fix">
+</p>
+
 ```
 You:    app: the login test is flaky, find out why
 Bot:    🟢 Working · Ran cargo test
