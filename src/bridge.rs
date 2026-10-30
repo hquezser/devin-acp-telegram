@@ -870,7 +870,13 @@ impl Bridge {
         };
         let r = self
             .acp
-            .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+            .request(
+                "session/new",
+                // Devin only persists a session after its first prompt:
+                // ask for it now so an empty session survives a restart.
+                json!({"cwd": cwd, "mcpServers": [],
+                       "_meta": {"cognition.ai/persistOnCreate": true}}),
+            )
             .await;
         let (sid, init) = match &r {
             Ok(v) => match v["sessionId"].as_str() {
