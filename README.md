@@ -23,6 +23,8 @@ It talks to Devin through the **[Agent Client Protocol](https://agentclientproto
 **bot you create**. Everything runs on your machine: no server, no inbound port, no
 database.
 
+> Unofficial project, not affiliated with or endorsed by Cognition.
+
 ## Features
 
 - **One forum topic per session** (optional): link a Telegram group with Topics and every
@@ -61,13 +63,25 @@ when it wakes up.
 
 ## Setup
 
-**Requirements:** Devin CLI installed and logged in (`devin auth login`), and Rust 1.89+ to
-build. macOS is the main target; Linux works too, without caffeine.
+**Requirements:** Devin CLI installed and logged in (`devin auth login`). macOS is the main
+target; Linux works too, without caffeine.
 
 1. **Create a bot**: talk to [@BotFather](https://t.me/BotFather), send `/newbot`, and copy
    the token.
 2. **Find your user id**: talk to [@userinfobot](https://t.me/userinfobot).
-3. **Install**:
+3. **Install** a prebuilt binary from the
+   [latest release](https://github.com/hquezser/devin-acp-telegram/releases/latest)
+   (macOS Apple Silicon and Intel, Linux x86_64 and arm64):
+   ```bash
+   curl -sL https://github.com/hquezser/devin-acp-telegram/releases/latest/download/devin-acp-telegram-aarch64-apple-darwin.tar.gz | tar xz
+   mkdir -p ~/.local/bin && mv devin-acp-telegram-*/devin-acp-telegram ~/.local/bin/
+   ```
+   Replace `aarch64-apple-darwin` with `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` or
+   `aarch64-unknown-linux-musl` for other machines. The binaries are not notarized: if you
+   download the archive with a browser, macOS blocks it until you run
+   `xattr -d com.apple.quarantine ~/.local/bin/devin-acp-telegram`.
+
+   Or build it with Rust 1.89+:
    ```bash
    cargo install --git https://github.com/hquezser/devin-acp-telegram
    ```
@@ -154,6 +168,9 @@ power with an external display.
   disables them, so use it knowingly.
 - Your bot token gives control of the bridge: keep the config file private (`chmod 600`).
   The token is never logged.
+- Telegram chats with bots are not end-to-end encrypted: your instructions and what Devin
+  sends back (answers, commands, diff excerpts) are stored on Telegram's servers like any
+  cloud chat. Don't use it on code you are not allowed to share with a third party.
 - Nothing listens on the network. The bridge only makes outbound HTTPS calls to
   `api.telegram.org`.
 - One bridge per bot: a lock in the state directory prevents a second instance from
