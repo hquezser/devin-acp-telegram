@@ -30,6 +30,8 @@ use crate::telegram::{self, Bot, Dest, Message, Update};
 const STATUS_EVERY: Duration = Duration::from_millis(2500);
 /// Sessions offered by /resume.
 const RESUME_MAX: usize = 8;
+/// Models offered as buttons by /model.
+const MODEL_BUTTONS: usize = 12;
 
 trait LockOk<T> {
     fn lock_ok(&self) -> MutexGuard<'_, T>;
@@ -53,6 +55,9 @@ struct Live {
     activity: String,
     plan: Vec<(String, String)>,
     mode: String,
+    /// Current model id and the agent's model list (id, display name).
+    model: String,
+    models: Vec<(String, String)>,
     used: u64,
     size: u64,
     /// Pending permission (shown in the status).
@@ -61,6 +66,74 @@ struct Live {
     /// `session/load` in progress: replayed history is ignored.
     loading: bool,
     dirty: bool,
+}
+
+impl Live {
+    /// Mode and model from a `session/new`/`session/load` result or a
+    /// `config_option_update` (`configOptions`, ids `mode` and `model`).
+    fn apply(&mut self, v: &Value) {
+        if let Some(m) = v["modes"]["currentModeId"].as_str() {
+            self.mode = m.to_string();
+        }
+        for opt in v["configOptions"].as_array().into_iter().flatten() {
+            let current = opt["currentValue"].as_str().unwrap_or("").to_string();
+            match opt["id"].as_str() {
+                Some("mode") if !current.is_empty() => self.mode = current,
+                Some("model") => {
+                    self.model = current;
+                    self.models = opt["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|o| {
+                            let id = o["value"].as_str()?.to_string();
+                            let name = o["name"].as_str().unwrap_or(&id).to_string();
+                            Some((id, name))
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn model_name(&self) -> String {
+        self.models
+            .iter()
+            .find(|(id, _)| *id == self.model)
+            .map_or_else(|| self.model.clone(), |(_, n)| n.clone())
+    }
+}
+
+/// `opus 5.5`, `Sonnet`, `gpt-6-sol`… → matching models, best first:
+/// an exact id/name, else the models whose display name *ends* with the
+/// query, else those containing it as is,
+/// else those containing every query word. Dots, spaces and underscores
+/// count as dashes.
+fn match_models(models: &[(String, String)], query: &str) -> Vec<(String, String)> {
+    let norm = |s: &str| s.to_lowercase().replace(['.', ' ', '_'], "-");
+    let q = norm(query.trim());
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let words: Vec<&str> = q.split('-').filter(|w| !w.is_empty()).collect();
+    let fits = |tier: u8, id: &str, name: &str| match tier {
+        0 => id == q || name == q,
+        // Display name only: Fusion ids end with their sidekick's id.
+        1 => name.ends_with(&q),
+        2 => id.contains(&q) || name.contains(&q),
+        _ => words.iter().all(|w| id.contains(w) || name.contains(w)),
+    };
+    (0..4)
+        .map(|tier| {
+            models
+                .iter()
+                .filter(|(id, name)| fits(tier, &norm(id), &norm(name)))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .find(|m| !m.is_empty())
+        .unwrap_or_default()
 }
 
 struct Perm {
@@ -112,6 +185,7 @@ enum Command_ {
     Projects,
     Stop,
     Mode(String),
+    Model(String),
     Close,
     Caffeine(String),
     Link,
@@ -133,6 +207,7 @@ fn command(text: &str) -> Option<Command_> {
         "projects" | "projets" => Command_::Projects,
         "stop" => Command_::Stop,
         "mode" => Command_::Mode(arg),
+        "model" | "modele" | "modèle" => Command_::Model(arg),
         "close" | "fermer" => Command_::Close,
         "caffeine" | "cafe" | "café" => Command_::Caffeine(arg),
         "link" | "lier" => Command_::Link,
@@ -185,6 +260,8 @@ pub struct Bridge {
     perms: Mutex<HashMap<u64, Perm>>,
     answered: Mutex<HashSet<u64>>,
     offers: Mutex<HashMap<u64, Offer>>,
+    /// /model buttons: token → (session, model id).
+    model_offers: Mutex<HashMap<u64, (String, String)>>,
     next_id: AtomicU64,
     caffeine: Mutex<Option<Child>>,
     out: mpsc::UnboundedSender<Out>,
@@ -211,6 +288,7 @@ impl Bridge {
             perms: Mutex::default(),
             answered: Mutex::default(),
             offers: Mutex::default(),
+            model_offers: Mutex::default(),
             next_id: AtomicU64::new(1),
             caffeine: Mutex::default(),
             out,
@@ -321,6 +399,11 @@ impl Bridge {
                 "mode",
                 "code | smart | ask | plan | bypass",
                 "code | smart | ask | plan | bypass",
+            ),
+            (
+                "model",
+                "Switch model: /model [name]",
+                "Changer de modèle : /model [nom]",
             ),
             (
                 "sessions",
@@ -522,6 +605,9 @@ impl Bridge {
             }
         }
         let mut foot = Vec::new();
+        if !l.model.is_empty() {
+            foot.push(l.model_name());
+        }
         if !l.mode.is_empty() {
             foot.push(format!("mode {}", l.mode));
         }
@@ -627,6 +713,10 @@ impl Bridge {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    l.dirty = true;
+                }
+                "config_option_update" => {
+                    l.apply(&json!({"configOptions": u["configOptions"]}));
                     l.dirty = true;
                 }
                 "current_mode_update" => {
@@ -782,15 +872,13 @@ impl Bridge {
             .acp
             .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
             .await;
-        let (sid, mode) = match &r {
+        let (sid, init) = match &r {
             Ok(v) => match v["sessionId"].as_str() {
-                Some(s) => (
-                    s.to_string(),
-                    v["modes"]["currentModeId"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
-                ),
+                Some(s) => {
+                    let mut l = Live::default();
+                    l.apply(v);
+                    (s.to_string(), l)
+                }
                 None => {
                     self.emit(Out::Notice {
                         to: origin,
@@ -814,7 +902,8 @@ impl Bridge {
             format!("[{tag}] {}", title_of(&prompt))
         };
         let dest = self.place(origin, &title).await;
-        self.adopt(&sid, &title, &cwd, dest, mode, false);
+        self.live.lock_ok().insert(sid.clone(), init);
+        self.adopt(&sid, &title, &cwd, dest);
         if dest != origin
             && let Some(t) = dest.thread
         {
@@ -840,15 +929,8 @@ impl Bridge {
     }
 
     /// Records a session (persisted) and its runtime state.
-    fn adopt(&self, sid: &str, title: &str, cwd: &str, dest: Dest, mode: String, loading: bool) {
-        self.live.lock_ok().insert(
-            sid.to_string(),
-            Live {
-                mode,
-                loading,
-                ..Default::default()
-            },
-        );
+    fn adopt(&self, sid: &str, title: &str, cwd: &str, dest: Dest) {
+        self.live.lock_ok().entry(sid.to_string()).or_default();
         let mut st = self.state.lock_ok();
         st.sessions.insert(
             sid.to_string(),
@@ -886,9 +968,7 @@ impl Bridge {
                 if let Some(l) = live.get_mut(sid) {
                     l.loading = false;
                     l.buf.clear();
-                    if let Some(m) = v["modes"]["currentModeId"].as_str() {
-                        l.mode = m.to_string();
-                    }
+                    l.apply(&v);
                 }
                 info!(session = sid, "session resumed");
                 Ok(())
@@ -958,6 +1038,88 @@ impl Bridge {
         if idle {
             self.emit(Out::Status { sid, fresh: false });
         }
+    }
+
+    /// /model [query]: switch directly on a single match, else buttons.
+    async fn model_cmd(self: Arc<Self>, origin: Dest, sid: String, query: String) {
+        let (models, current) = match self.live.lock_ok().get(&sid) {
+            Some(l) => (l.models.clone(), l.model_name()),
+            None => (Vec::new(), String::new()),
+        };
+        if models.is_empty() {
+            return self.emit(Out::Notice {
+                to: origin,
+                text: self.tr.model_unknown().to_string(),
+            });
+        }
+        let choices = if query.is_empty() {
+            models
+        } else {
+            match match_models(&models, &query).as_slice() {
+                [] => {
+                    return self.emit(Out::Notice {
+                        to: origin,
+                        text: self.tr.model_none(&query),
+                    });
+                }
+                [(id, _)] => return self.set_model(&sid, id).await,
+                many => many.to_vec(),
+            }
+        };
+        let buttons: Vec<Value> = choices
+            .iter()
+            .take(MODEL_BUTTONS)
+            .map(|(id, name)| {
+                let token = self.next();
+                self.model_offers
+                    .lock_ok()
+                    .insert(token, (sid.clone(), id.clone()));
+                json!({"text": name, "callback_data": format!("m:{token}")})
+            })
+            .collect();
+        let keyboard: Vec<Value> = buttons.chunks(2).map(|row| json!(row)).collect();
+        let more = choices.len().saturating_sub(MODEL_BUTTONS);
+        if let Err(e) = self
+            .bot
+            .send(
+                origin,
+                &self.tr.model_pick(&current, more),
+                false,
+                Some(json!({"inline_keyboard": keyboard})),
+            )
+            .await
+        {
+            warn!(error = %e, "model list not sent");
+        }
+    }
+
+    async fn set_model(&self, sid: &str, model: &str) {
+        let r = self
+            .acp
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": sid, "configId": "model", "value": model}),
+            )
+            .await;
+        let text = match r {
+            Ok(v) => {
+                let mut live = self.live.lock_ok();
+                match live.get_mut(sid) {
+                    Some(l) => {
+                        l.apply(&v);
+                        l.dirty = true;
+                        self.tr.model_set(&l.model_name())
+                    }
+                    None => self.tr.model_set(model),
+                }
+            }
+            Err(e) => self.tr.model_refused(model, &e.to_string()),
+        };
+        self.emit(Out::Text {
+            sid: sid.to_string(),
+            text,
+            silent: true,
+        });
     }
 
     async fn set_mode(&self, sid: &str, mode: &str) {
@@ -1133,6 +1295,12 @@ impl Bridge {
             }
             Some(Command_::Sessions) => reply(self.sessions_text()),
             Some(Command_::Projects) => reply(self.tr.projects(&self.cfg.cwd, &self.cfg.projects)),
+            Some(Command_::Model(arg)) => {
+                let Some(sid) = pick(true) else {
+                    return reply(self.tr.no_session().to_string());
+                };
+                tokio::spawn(self.clone().model_cmd(origin, sid, arg));
+            }
             Some(Command_::Caffeine(arg)) => {
                 let on = match arg.to_lowercase().as_str() {
                     "" | "on" | "1" => true,
@@ -1395,6 +1563,17 @@ impl Bridge {
                 .await;
             p.tx.send(p.option_ids.get(idx).cloned()).ok();
             answer(format!("✓ {label}")).await;
+        } else if let Some(token) = data.strip_prefix("m:") {
+            let Some((sid, model)) = token
+                .parse::<u64>()
+                .ok()
+                .and_then(|t| self.model_offers.lock_ok().remove(&t))
+            else {
+                return answer(self.tr.expired().to_string()).await;
+            };
+            answer(format!("🧠 {model}")).await;
+            let me = self.clone();
+            tokio::spawn(async move { me.set_model(&sid, &model).await });
         } else if let Some(token) = data.strip_prefix("r:") {
             let Some(offer) = token
                 .parse::<u64>()
@@ -1429,13 +1608,7 @@ impl Bridge {
             });
         }
         let dest = self.place(origin, &title).await;
-        let mode = self
-            .live
-            .lock_ok()
-            .get(&offer.session)
-            .map(|l| l.mode.clone())
-            .unwrap_or_default();
-        self.adopt(&offer.session, &title, &offer.cwd, dest, mode, false);
+        self.adopt(&offer.session, &title, &offer.cwd, dest);
         if dest != origin
             && let Some(t) = dest.thread
         {
@@ -1473,9 +1646,64 @@ mod tests {
         // Devin's own commands are forwarded.
         assert_eq!(command("/compact"), None);
         assert_eq!(command("stop"), None);
+        assert_eq!(
+            command("/model opus 5.5"),
+            Some(Command_::Model("opus 5.5".into()))
+        );
         assert_eq!(mode_id("Code"), Some("accept-edits"));
         assert_eq!(mode_id("yolo"), Some("bypass"));
         assert_eq!(mode_id("nope"), None);
+    }
+
+    #[test]
+    fn models_from_config_and_fuzzy_match() {
+        let mut l = Live::default();
+        l.apply(&json!({
+            "modes": {"currentModeId": "accept-edits"},
+            "configOptions": [
+                {"id": "mode", "currentValue": "plan"},
+                {"id": "model", "currentValue": "swe-2-high", "options": [
+                    {"value": "swe-2-high", "name": "SWE-2"},
+                    {"value": "claude-opus-5-5-medium", "name": "Claude Opus 5.5"},
+                    {"value": "claude-opus-4-8-medium", "name": "Claude Opus 4.8"},
+                    {"value": "claude-sonnet-5-5-medium", "name": "Claude Sonnet 5.5"},
+                    {"value": "claude-sonnet-5-medium", "name": "Claude Sonnet 5"},
+                    {"value": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+                     "name": "Fusion (Claude Sonnet 5.5 High + SWE-2 Medium)"},
+                    {"value": "fusion-gpt-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                     "name": "Fusion (GPT-6 Sol High Thinking + Claude Sonnet 5.5 Medium)"},
+                    {"value": "gpt-6-sol-medium", "name": "GPT-6 Sol"}]}]
+        }));
+        assert_eq!((l.mode.as_str(), l.model.as_str()), ("plan", "swe-2-high"));
+        assert_eq!(l.model_name(), "SWE-2");
+        let ids = |q: &str| -> Vec<String> {
+            match_models(&l.models, q)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids("opus 5.5"), ["claude-opus-5-5-medium"]);
+        assert_eq!(ids("sonnet 5.5"), ["claude-sonnet-5-5-medium"]);
+        assert_eq!(
+            ids("Opus"),
+            ["claude-opus-5-5-medium", "claude-opus-4-8-medium"]
+        );
+        assert_eq!(ids("swe-2"), ["swe-2-high"]);
+        assert_eq!(ids("GPT-6 Sol"), ["gpt-6-sol-medium"]);
+        assert_eq!(
+            ids("5.5"),
+            ["claude-opus-5-5-medium", "claude-sonnet-5-5-medium"]
+        );
+        // Word fallback: every word, in any order.
+        assert_eq!(
+            ids("sol gpt"),
+            [
+                "fusion-gpt-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "gpt-6-sol-medium"
+            ]
+        );
+        assert!(ids("llama").is_empty());
+        assert!(ids("  ").is_empty());
     }
 
     #[test]

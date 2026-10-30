@@ -146,8 +146,16 @@ impl Config {
                 .unwrap_or_default(),
             devin_bin: var("DEVIN_BIN").unwrap_or_else(|| "devin".to_string()),
             acp_args: var("DEVIN_ACP_ARGS")
-                .map(|a| a.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_default(),
+                .map(|a| a.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                // DEVIN_MODEL: default model of new sessions (`devin acp --model`).
+                .chain(
+                    var("DEVIN_MODEL")
+                        .into_iter()
+                        .flat_map(|m| ["--model".to_string(), m]),
+                )
+                .collect(),
             mode: var("DEVIN_MODE"),
             caffeine: var("DEVIN_CAFFEINE").is_none_or(|v| v != "0"),
             lang: var("DEVIN_TG_LANG")
@@ -260,6 +268,11 @@ mod tests {
         assert!(c.caffeine);
         assert_eq!(c.lang, Lang::En);
         assert_eq!(c.devin_bin, "devin");
+        assert!(c.acp_args.is_empty());
+        v.insert("DEVIN_ACP_ARGS".into(), "--x 1".into());
+        v.insert("DEVIN_MODEL".into(), "opus".into());
+        let c2 = Config::from_map(&v, cwd.clone()).unwrap();
+        assert_eq!(c2.acp_args, ["--x", "1", "--model", "opus"]);
         assert!(c.is_allowed(34) && !c.is_allowed(56));
         assert!(Config::from_map(&v, "/does/not/exist".into()).is_err());
     }

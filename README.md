@@ -9,7 +9,7 @@ You:    app: the login test is flaky, find out why
 Bot:    🟢 Working · Ran cargo test
         ▶️ Reproduce the failure
         ▫️ Fix the race
-        ⚙️ mode accept-edits · context 41k/262k
+        ⚙️ Claude Opus 5.5 · mode accept-edits · context 41k/262k
 Bot:    🔐 Allow? Ran git push
         $ git push origin fix/login-race
         [✅ Allow] [♾️ Always allow `git push`] [⛔ Reject]
@@ -34,6 +34,9 @@ database.
   waits for your tap, like in the terminal.
 - **Mid-turn messages**: a message sent while Devin is working is folded into the running
   turn (Devin supports this natively). Nothing is queued until the end.
+- **Switch models from your phone**: `/model` shows the main models as buttons, and
+  `/model opus 5.5` searches the whole list (Devin offers 100+) and switches right away when
+  one model matches. The current model is shown in the status.
 - **/stop, /mode, Devin's commands**: interrupt a turn, switch between `code`, `smart`, `ask`,
   `plan` and `bypass`. Devin's own slash commands (`/compact`, `/plan`…) pass through.
 - **All your projects, one bridge**: aliases (`/new api: run the migrations`) pick the working
@@ -98,6 +101,7 @@ to talk to its session. `/unlink` goes back to the private chat.
 | `/resume [project]` | pick a recent Devin session to continue |
 | `/stop` | interrupt the current turn |
 | `/mode code\|smart\|ask\|plan\|bypass` | switch the session mode |
+| `/model [name]` | switch the model: buttons, or a search (`/model sonnet 5.5`) |
 | `/sessions` | bridge and session status |
 | `/projects` | project aliases |
 | `/close` | end the session (closes its topic) |
@@ -119,6 +123,7 @@ Environment variables, or the same keys in `~/.config/devin-acp-telegram/config.
 | `DEVIN_PROJECTS` | none | `alias=dir,…` for `/new alias: …` |
 | `DEVIN_CWD` | current directory | default working directory (the CLI argument wins) |
 | `DEVIN_MODE` | Devin's default | mode of new sessions |
+| `DEVIN_MODEL` | Devin's default | model of new sessions (`devin acp --model`, fuzzy names like `opus`) |
 | `DEVIN_CAFFEINE` | `1` | `0` to let the machine sleep |
 | `DEVIN_TG_LANG` | `en` | `fr` for French messages |
 | `DEVIN_BIN` | `devin` | agent executable (run as `<bin> acp`) |

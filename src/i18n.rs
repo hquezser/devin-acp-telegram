@@ -61,6 +61,7 @@ impl Tr {
 • /resume [project]: pick a recent Devin session to continue\n\
 • /stop: interrupt the current turn\n\
 • /mode code|smart|ask|plan|bypass\n\
+• /model [name]: switch model (buttons, or search: /model opus)\n\
 • /sessions: bridge and session status\n\
 • /close: end the session\n\
 • /caffeine on|off: keep the Mac awake (or not)\n\
@@ -73,6 +74,7 @@ Other commands (/compact, /plan…) go to Devin.",
 • /resume [projet] : reprendre une session Devin récente\n\
 • /stop : interrompt le tour en cours\n\
 • /mode code|smart|ask|plan|bypass\n\
+• /model [nom] : changer de modèle (boutons, ou recherche : /model opus)\n\
 • /sessions : état du pont et des sessions\n\
 • /close : termine la session\n\
 • /caffeine on|off : empêche (ou non) la veille du Mac\n\
@@ -122,6 +124,51 @@ Les autres commandes (/compact, /plan…) partent à Devin."
             self,
             format!("🔴 Mode {mode} refused: {e}"),
             format!("🔴 Mode {mode} refusé : {e}")
+        )
+    }
+
+    pub fn model_set(&self, name: &str) -> String {
+        tr!(
+            self,
+            format!("🧠 Model: {name}"),
+            format!("🧠 Modèle : {name}")
+        )
+    }
+
+    pub fn model_refused(&self, model: &str, e: &str) -> String {
+        tr!(
+            self,
+            format!("🔴 Model {model} refused: {e}"),
+            format!("🔴 Modèle {model} refusé : {e}")
+        )
+    }
+
+    pub fn model_pick(&self, current: &str, more: usize) -> String {
+        let more = match (self.0, more) {
+            (_, 0) => String::new(),
+            (Lang::En, n) => format!("\n(+{n} more: /model <name> to search)"),
+            (Lang::Fr, n) => format!("\n(+{n} autres : /model <nom> pour chercher)"),
+        };
+        tr!(
+            self,
+            format!("🧠 Current model: {current}. Pick one:{more}"),
+            format!("🧠 Modèle actuel : {current}. Choisis :{more}")
+        )
+    }
+
+    pub fn model_none(&self, query: &str) -> String {
+        tr!(
+            self,
+            format!("No model matches \"{query}\". /model lists them."),
+            format!("Aucun modèle ne correspond à « {query} ». /model les liste.")
+        )
+    }
+
+    pub fn model_unknown(&self) -> &'static str {
+        tr!(
+            self,
+            "Devin has not sent its model list for this session yet.",
+            "Devin n'a pas encore envoyé sa liste de modèles pour cette session."
         )
     }
 

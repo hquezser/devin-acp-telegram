@@ -35,6 +35,7 @@ Configuration: environment variables or ~/.config/devin-acp-telegram/config.env
   TELEGRAM_ALLOWED_USERS   comma-separated Telegram user ids (required)
   DEVIN_PROJECTS           aliases: app=~/code/app,api=~/code/api
   DEVIN_MODE               mode of new sessions (accept-edits, smart, ask, plan, bypass)
+  DEVIN_MODEL              model of new sessions (e.g. opus)
   DEVIN_CAFFEINE=0         don't keep the Mac awake
   DEVIN_TG_LANG=fr         French messages
   DEVIN_BIN, DEVIN_ACP_ARGS, DEVIN_TG_STATE_DIR, DEVIN_TG_CONFIG
