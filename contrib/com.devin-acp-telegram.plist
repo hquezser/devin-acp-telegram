@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent: starts devin-acp-telegram at login and restarts it if it
+  stops. Replace YOU and the paths, copy to ~/Library/LaunchAgents/ and
+  `launchctl load` it. Configuration comes from
+  ~/.config/devin-acp-telegram/config.env.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devin-acp-telegram</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.cargo/bin/devin-acp-telegram</string>
+    <string>/Users/YOU/code</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd has a minimal PATH: include where `devin` lives. -->
+    <key>PATH</key>
+    <string>/Users/YOU/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/devin-acp-telegram.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/devin-acp-telegram.log</string>
+</dict>
+</plist>
