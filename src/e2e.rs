@@ -258,7 +258,9 @@ async fn remote_control_round_trip() {
     let b = h
         .expect("sendMessage", |b| text_is(b, "🔐 Allow? Ran curl"))
         .await;
-    assert!(text_is(&b, "$ curl -sI example.com"));
+    // The command is a code block (entity), not literal backticks.
+    assert!(text_is(&b, "\ncurl -sI example.com"), "{b}");
+    assert_eq!(b["entities"][0]["type"], "pre");
     let data = b["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
         .as_str()
         .unwrap()

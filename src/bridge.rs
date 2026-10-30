@@ -552,7 +552,7 @@ impl Bridge {
                 let keyboard: Vec<Value> = labels
                     .iter()
                     .enumerate()
-                    .map(|(i, l)| json!([{"text": l, "callback_data": format!("p:{qid}:{i}")}]))
+                    .map(|(i, l)| json!([{"text": l.replace('`', ""), "callback_data": format!("p:{qid}:{i}")}]))
                     .collect();
                 let text = Self::header(&s, &text);
                 // The agent waits for this answer: keep trying.
@@ -817,7 +817,7 @@ impl Bridge {
             .or_else(|| tc["rawInput"]["command"].as_str());
         let mut text = self.tr.permission(&title);
         if let Some(c) = cmd {
-            text.push_str(&format!("\n$ {c}"));
+            text.push_str(&format!("\n```\n{c}\n```"));
         }
         let opts = p["options"].as_array().cloned().unwrap_or_default();
         let opts: Vec<Value> = opts.into_iter().take(8).collect();
@@ -1614,12 +1614,13 @@ impl Bridge {
                 .session(&p.session)
                 .map(|s| Self::header(&s, &p.text))
                 .unwrap_or(p.text.clone());
-            self.bot
-                .try_call(
-                    "editMessageText",
-                    json!({"chat_id": chat, "message_id": msg, "text": format!("{text}\n\n→ {label}")}),
-                )
-                .await;
+            if let Err(e) = self
+                .bot
+                .edit(chat, msg, &format!("{text}\n\n→ {label}"))
+                .await
+            {
+                warn!(error = %e, "permission answer not shown");
+            }
             p.tx.send(p.option_ids.get(idx).cloned()).ok();
             answer(format!("✓ {label}")).await;
         } else if let Some(token) = data.strip_prefix("m:") {

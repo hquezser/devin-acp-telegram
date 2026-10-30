@@ -8,6 +8,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::markup;
+
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// `getUpdates` long-polling wait.
 pub const POLL_TIMEOUT: u64 = 30;
@@ -186,9 +188,11 @@ impl Bot {
         silent: bool,
         markup: Option<Value>,
     ) -> anyhow::Result<i64> {
+        let (text, entities) = markup::render(text);
         let mut body = json!({
             "chat_id": to.chat,
             "text": text,
+            "entities": entities,
             "disable_notification": silent,
             "link_preview_options": {"is_disabled": true},
         });
@@ -213,10 +217,12 @@ impl Bot {
 
     /// Edits a message; "not modified" counts as success.
     pub async fn edit(&self, chat: i64, msg: i64, text: &str) -> anyhow::Result<()> {
+        let (text, entities) = markup::render(text);
         match self
             .call(
                 "editMessageText",
                 &json!({"chat_id": chat, "message_id": msg, "text": text,
+                        "entities": entities,
                         "link_preview_options": {"is_disabled": true}}),
             )
             .await

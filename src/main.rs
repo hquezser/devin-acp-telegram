@@ -9,6 +9,7 @@ mod config;
 #[cfg(test)]
 mod e2e;
 mod i18n;
+mod markup;
 mod state;
 mod telegram;
 
