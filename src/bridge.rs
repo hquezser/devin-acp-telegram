@@ -58,6 +58,9 @@ struct Live {
     /// Current model id and the agent's model list (id, display name).
     model: String,
     models: Vec<(String, String)>,
+    /// Thinking effort (`thought_level`: medium/high/max) and its choices.
+    effort: String,
+    efforts: Vec<String>,
     used: u64,
     size: u64,
     /// Pending permission (shown in the status).
@@ -79,6 +82,15 @@ impl Live {
             let current = opt["currentValue"].as_str().unwrap_or("").to_string();
             match opt["id"].as_str() {
                 Some("mode") if !current.is_empty() => self.mode = current,
+                Some("thought_level") => {
+                    self.effort = current;
+                    self.efforts = opt["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|o| o["value"].as_str().map(str::to_string))
+                        .collect();
+                }
                 Some("model") => {
                     self.model = current;
                     self.models = opt["options"]
@@ -97,11 +109,18 @@ impl Live {
         }
     }
 
+    /// Display name with the effort, like Devin's own picker: `SWE-2 Max`.
     fn model_name(&self) -> String {
-        self.models
+        let name = self
+            .models
             .iter()
             .find(|(id, _)| *id == self.model)
-            .map_or_else(|| self.model.clone(), |(_, n)| n.clone())
+            .map_or_else(|| self.model.clone(), |(_, n)| n.clone());
+        let mut effort = self.effort.chars();
+        match effort.next() {
+            Some(c) => format!("{name} {}{}", c.to_uppercase(), effort.as_str()),
+            None => name,
+        }
     }
 }
 
@@ -186,6 +205,7 @@ enum Command_ {
     Stop,
     Mode(String),
     Model(String),
+    Effort(String),
     Close,
     Caffeine(String),
     Link,
@@ -208,6 +228,7 @@ fn command(text: &str) -> Option<Command_> {
         "stop" => Command_::Stop,
         "mode" => Command_::Mode(arg),
         "model" | "modele" | "modèle" => Command_::Model(arg),
+        "effort" | "reflexion" | "réflexion" | "thinking" => Command_::Effort(arg),
         "close" | "fermer" => Command_::Close,
         "caffeine" | "cafe" | "café" => Command_::Caffeine(arg),
         "link" | "lier" => Command_::Link,
@@ -404,6 +425,11 @@ impl Bridge {
                 "model",
                 "Switch model: /model [name]",
                 "Changer de modèle : /model [nom]",
+            ),
+            (
+                "effort",
+                "Thinking effort: medium | high | max",
+                "Niveau de réflexion : medium | high | max",
             ),
             (
                 "sessions",
@@ -1100,11 +1126,18 @@ impl Bridge {
     }
 
     async fn set_model(&self, sid: &str, model: &str) {
+        self.set_config(sid, "model", model).await;
+    }
+
+    /// `session/set_config_option` (model, thought_level…); the result
+    /// carries the updated options.
+    async fn set_config(&self, sid: &str, id: &str, value: &str) {
+        let model = value;
         let r = self
             .acp
             .request(
                 "session/set_config_option",
-                json!({"sessionId": sid, "configId": "model", "value": model}),
+                json!({"sessionId": sid, "configId": id, "value": value}),
             )
             .await;
         let text = match r {
@@ -1301,6 +1334,26 @@ impl Bridge {
             }
             Some(Command_::Sessions) => reply(self.sessions_text()),
             Some(Command_::Projects) => reply(self.tr.projects(&self.cfg.cwd, &self.cfg.projects)),
+            Some(Command_::Effort(arg)) => {
+                let Some(sid) = pick(true) else {
+                    return reply(self.tr.no_session().to_string());
+                };
+                let efforts = self
+                    .live
+                    .lock_ok()
+                    .get(&sid)
+                    .map(|l| l.efforts.clone())
+                    .unwrap_or_default();
+                let level = arg.to_lowercase();
+                if efforts.contains(&level) {
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        me.set_config(&sid, "thought_level", &level).await;
+                    });
+                } else {
+                    reply(self.tr.effort_usage(&efforts.join(" | ")));
+                }
+            }
             Some(Command_::Model(arg)) => {
                 let Some(sid) = pick(true) else {
                     return reply(self.tr.no_session().to_string());
@@ -1682,6 +1735,16 @@ mod tests {
         }));
         assert_eq!((l.mode.as_str(), l.model.as_str()), ("plan", "swe-2-high"));
         assert_eq!(l.model_name(), "SWE-2");
+        l.apply(
+            &json!({"configOptions": [{"id": "thought_level", "currentValue": "max",
+            "options": [{"value": "medium"}, {"value": "high"}, {"value": "max"}]}]}),
+        );
+        assert_eq!(l.model_name(), "SWE-2 Max");
+        assert_eq!(l.efforts, ["medium", "high", "max"]);
+        assert_eq!(
+            command("/effort high"),
+            Some(Command_::Effort("high".into()))
+        );
         let ids = |q: &str| -> Vec<String> {
             match_models(&l.models, q)
                 .into_iter()

@@ -62,6 +62,7 @@ impl Tr {
 • /stop: interrupt the current turn\n\
 • /mode code|smart|ask|plan|bypass\n\
 • /model [name]: switch model (buttons, or search: /model opus)\n\
+• /effort medium|high|max: thinking effort\n\
 • /sessions: bridge and session status\n\
 • /close: end the session\n\
 • /caffeine on|off: keep the Mac awake (or not)\n\
@@ -75,6 +76,7 @@ Other commands (/compact, /plan…) go to Devin.",
 • /stop : interrompt le tour en cours\n\
 • /mode code|smart|ask|plan|bypass\n\
 • /model [nom] : changer de modèle (boutons, ou recherche : /model opus)\n\
+• /effort medium|high|max : niveau de réflexion\n\
 • /sessions : état du pont et des sessions\n\
 • /close : termine la session\n\
 • /caffeine on|off : empêche (ou non) la veille du Mac\n\
@@ -161,6 +163,19 @@ Les autres commandes (/compact, /plan…) partent à Devin."
             self,
             format!("No model matches \"{query}\". /model lists them."),
             format!("Aucun modèle ne correspond à « {query} ». /model les liste.")
+        )
+    }
+
+    pub fn effort_usage(&self, levels: &str) -> String {
+        let levels = if levels.is_empty() {
+            "medium | high | max"
+        } else {
+            levels
+        };
+        tr!(
+            self,
+            format!("Usage: /effort {levels}"),
+            format!("Usage : /effort {levels}")
         )
     }
 

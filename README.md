@@ -9,7 +9,7 @@ You:    app: the login test is flaky, find out why
 Bot:    🟢 Working · Ran cargo test
         ▶️ Reproduce the failure
         ▫️ Fix the race
-        ⚙️ Claude Opus 5.5 · mode accept-edits · context 41k/262k
+        ⚙️ SWE-2 Max · mode accept-edits · context 41k/262k
 Bot:    🔐 Allow? Ran git push
         $ git push origin fix/login-race
         [✅ Allow] [♾️ Always allow `git push`] [⛔ Reject]
@@ -36,7 +36,8 @@ database.
   turn (Devin supports this natively). Nothing is queued until the end.
 - **Switch models from your phone**: `/model` shows the main models as buttons, and
   `/model opus 5.5` searches the whole list (Devin offers 100+) and switches right away when
-  one model matches. The current model is shown in the status.
+  one model matches. `/effort` sets the thinking effort. The status shows both
+  (`SWE-2 Max`). New sessions follow your Devin CLI defaults (`~/.config/devin/config.json`).
 - **/stop, /mode, Devin's commands**: interrupt a turn, switch between `code`, `smart`, `ask`,
   `plan` and `bypass`. Devin's own slash commands (`/compact`, `/plan`…) pass through.
 - **All your projects, one bridge**: aliases (`/new api: run the migrations`) pick the working
@@ -102,6 +103,7 @@ to talk to its session. `/unlink` goes back to the private chat.
 | `/stop` | interrupt the current turn |
 | `/mode code\|smart\|ask\|plan\|bypass` | switch the session mode |
 | `/model [name]` | switch the model: buttons, or a search (`/model sonnet 5.5`) |
+| `/effort medium\|high\|max` | thinking effort of the session |
 | `/sessions` | bridge and session status |
 | `/projects` | project aliases |
 | `/close` | end the session (closes its topic) |
