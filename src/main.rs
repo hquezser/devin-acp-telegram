@@ -1,9 +1,11 @@
 //! devin-acp-telegram — drive Devin CLI from Telegram.
 //!
-//! Runs `devin acp` (Agent Client Protocol over stdio) and a dedicated
-//! Telegram bot on the same machine: no server, no open port.
+//! Runs `devin acp` (Agent Client Protocol over stdio, one process per
+//! session) and a dedicated Telegram bot on the same machine: no server,
+//! no open port.
 
 mod acp;
+mod agent;
 mod bridge;
 mod config;
 #[cfg(test)]
@@ -13,12 +15,9 @@ mod markup;
 mod state;
 mod telegram;
 
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use serde_json::json;
-use tokio::io::BufReader;
 use tokio::process::Command;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -76,46 +75,19 @@ async fn hostname() -> String {
 }
 
 /// One life of the bridge: returns Ok on a stop signal, Err when the
-/// agent dies (the caller restarts it).
+/// control agent dies (the caller restarts it).
 async fn run(cfg: &config::Config, initial: Option<String>) -> anyhow::Result<()> {
-    let mut child = Command::new(&cfg.devin_bin)
-        .arg("acp")
-        .args(&cfg.acp_args)
-        .current_dir(&cfg.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "cannot start `{} acp` (is Devin CLI installed?)",
-                cfg.devin_bin
-            )
-        })?;
-    let stdin = child.stdin.take().context("agent stdin")?;
-    let stdout = child.stdout.take().context("agent stdout")?;
-    let (acp, incoming) = acp::Acp::start(BufReader::new(stdout), Box::new(stdin));
-    let init = acp.request(
-        "initialize",
-        json!({
-            "protocolVersion": 1,
-            // No fs/terminal on our side: the agent keeps its own tools.
-            "clientCapabilities": {
-                "fs": {"readTextFile": false, "writeTextFile": false},
-                "terminal": false,
-            },
-            "clientInfo": {"name": "devin-acp-telegram", "version": env!("CARGO_PKG_VERSION")},
-        }),
+    let spawn = agent::devin(cfg);
+    let control = spawn().await?;
+    let mut child = control.child.context("control agent process")?;
+    info!("connected to Devin");
+    let (bridge, mut tasks) = bridge::Bridge::start(
+        cfg.clone(),
+        control.acp,
+        control.incoming,
+        spawn,
+        hostname().await,
     );
-    let init = tokio::time::timeout(Duration::from_secs(60), init)
-        .await
-        .context("the agent did not answer `initialize`")??;
-    info!(
-        agent = init["agentInfo"]["title"].as_str().unwrap_or("?"),
-        "connected to the agent"
-    );
-    let (bridge, mut tasks) = bridge::Bridge::start(cfg.clone(), acp, incoming, hostname().await);
     bridge.startup(&mut tasks, initial).await;
     let r = tokio::select! {
         s = child.wait() => Err(anyhow!("agent exited ({})", s.map(|s| s.to_string()).unwrap_or_default())),

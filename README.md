@@ -38,6 +38,8 @@ database.
   mode and context usage. Interim text is sent silently, and only the final answer notifies you.
 - **Permission buttons**: Devin's own options (allow once, always allow, reject…). The agent
   waits for your tap, like in the terminal.
+- **Parallel sessions**: each session runs in its own `devin acp` process, so one session
+  waiting for your tap never holds up another (Devin runs one turn at a time per process).
 - **Mid-turn messages**: a message sent while Devin is working is folded into the running
   turn (Devin supports this natively). Nothing is queued until the end.
 - **Switch models from your phone**: `/model` shows the main models as buttons, and
@@ -57,11 +59,13 @@ database.
 ## How it works
 
 ```
-Telegram  ⇄  devin-acp-telegram (your machine)  ⇄  devin acp (stdio, JSON-RPC)
-             long-polling, outbound only            sessions, tools, permissions
+Telegram  ⇄  devin-acp-telegram (your machine)  ⇄  devin acp × N (stdio, JSON-RPC)
+             long-polling, outbound only            one per session: tools, permissions
 ```
 
-The bridge polls the Bot API (`getUpdates`) and drives one `devin acp` process. Telegram keeps
+The bridge polls the Bot API (`getUpdates`) and gives each session its own `devin acp` process,
+started on the session's first message (so sessions left open cost nothing until you use them
+again). Telegram keeps
 undelivered messages for 24 h, so messages you send while the machine sleeps are handled
 when it wakes up.
 
@@ -191,7 +195,7 @@ binary with no runtime to install.
 ## Limitations
 
 - Text only for now: no images or voice messages.
-- One `devin acp` process per bridge: sessions run concurrently inside it.
+- Each open session keeps its own `devin acp` process (about 25 MB) until `/close`.
 - Telegram drops undelivered messages after 24 h.
 
 ## License

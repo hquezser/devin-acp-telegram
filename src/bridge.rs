@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::acp::{Acp, Incoming};
+use crate::agent::Spawn;
 use crate::config::Config;
 use crate::i18n::Tr;
 use crate::state::{self, Session, State};
@@ -270,11 +271,23 @@ fn option_label(o: &Value) -> String {
     format!("{mark} {}", o["name"].as_str().unwrap_or("?"))
 }
 
+/// A session's own agent; dropping it kills the process.
+struct Slot {
+    acp: Arc<Acp>,
+    _child: Option<Child>,
+}
+
 pub struct Bridge {
     cfg: Config,
     tr: Tr,
     bot: Bot,
-    acp: Arc<Acp>,
+    /// Agent without sessions, for `session/list`.
+    control: Arc<Acp>,
+    spawn: Spawn,
+    /// One agent per session: Devin runs one turn at a time per process.
+    agents: Mutex<HashMap<String, Slot>>,
+    /// Serializes lazy agent start-ups, so a session never gets two.
+    starting: tokio::sync::Mutex<()>,
     host: String,
     state: Mutex<State>,
     live: Mutex<HashMap<String, Live>>,
@@ -293,8 +306,9 @@ impl Bridge {
     /// events, outbox, status ticker) in the returned set.
     pub fn start(
         cfg: Config,
-        acp: Arc<Acp>,
+        control: Arc<Acp>,
         incoming: mpsc::UnboundedReceiver<Incoming>,
+        spawn: Spawn,
         host: String,
     ) -> (Arc<Bridge>, JoinSet<()>) {
         let (out, out_rx) = mpsc::unbounded_channel();
@@ -303,7 +317,10 @@ impl Bridge {
             bot: Bot::new(&cfg.api_url, &cfg.token),
             state: Mutex::new(State::load(&cfg.state_dir)),
             cfg,
-            acp,
+            control: control.clone(),
+            spawn,
+            agents: Mutex::default(),
+            starting: tokio::sync::Mutex::new(()),
             host,
             live: Mutex::default(),
             perms: Mutex::default(),
@@ -316,7 +333,7 @@ impl Bridge {
         });
         let mut tasks = JoinSet::new();
         tasks.spawn(bridge.clone().run_outbox(out_rx));
-        tasks.spawn(bridge.clone().run_incoming(incoming));
+        tasks.spawn(bridge.clone().run_incoming(control, incoming));
         tasks.spawn(bridge.clone().run_ticker());
         (bridge, tasks)
     }
@@ -348,8 +365,8 @@ impl Bridge {
             .collect()
     }
 
-    /// Announces itself, registers the command menu, resumes the sessions
-    /// left open, applies caffeine, then starts Telegram polling.
+    /// Announces itself, registers the command menu, applies caffeine,
+    /// then starts Telegram polling.
     pub async fn startup(self: &Arc<Self>, tasks: &mut JoinSet<()>, initial: Option<String>) {
         let caffeine = self.cfg.caffeine && self.set_caffeine(true);
         self.register_commands().await;
@@ -359,26 +376,7 @@ impl Bridge {
                 warn!(error = %e, "announce failed (has the user started the bot?)");
             }
         }
-        let open: Vec<(String, String)> = self
-            .state
-            .lock_ok()
-            .sessions
-            .iter()
-            .map(|(id, s)| (id.clone(), s.cwd.clone()))
-            .collect();
-        for (sid, cwd) in open {
-            if let Err(e) = self.load(&sid, &cwd).await {
-                warn!(error = %e, session = sid, "session not resumed");
-                if let Some(s) = self.session(&sid) {
-                    self.emit(Out::Notice {
-                        to: s.dest(),
-                        text: self.tr.not_resumed(&e.to_string()),
-                    });
-                }
-                self.state.lock_ok().remove(&sid);
-                self.save();
-            }
-        }
+        // Sessions left open get their agent back on their next message.
         tasks.spawn(self.clone().run_updates());
         if let Some(p) = initial.filter(|p| !p.trim().is_empty())
             && let Some(&owner) = self.cfg.allowed_users.first()
@@ -392,6 +390,8 @@ impl Bridge {
     }
 
     pub async fn shutdown(&self, error: Option<&str>) {
+        // Kills the session agents (their event loops end with them).
+        self.agents.lock_ok().clear();
         let msg = self.tr.offline(error);
         for to in self.owners() {
             self.bot.send(to, &msg, true, None).await.ok();
@@ -670,13 +670,67 @@ impl Bridge {
     // -----------------------------------------------------------------
     // Agent → bridge
 
-    async fn run_incoming(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Incoming>) {
+    async fn run_incoming(
+        self: Arc<Self>,
+        acp: Arc<Acp>,
+        mut rx: mpsc::UnboundedReceiver<Incoming>,
+    ) {
         while let Some(i) = rx.recv().await {
             match i {
                 Incoming::Update(p) => self.on_update(&p),
                 Incoming::Request { id, method, params } => {
-                    tokio::spawn(self.clone().on_request(id, method, params));
+                    tokio::spawn(self.clone().on_request(acp.clone(), id, method, params));
                 }
+            }
+        }
+        // Agent gone. A session's agent that died unasked is restarted
+        // (and the session reloaded) on its next message.
+        let mut agents = self.agents.lock_ok();
+        if let Some(sid) = agents
+            .iter()
+            .find(|(_, s)| Arc::ptr_eq(&s.acp, &acp))
+            .map(|(id, _)| id.clone())
+        {
+            warn!(session = sid, "session agent exited");
+            agents.remove(&sid);
+        }
+    }
+
+    /// Starts an agent and routes its events.
+    async fn start_agent(self: &Arc<Self>) -> anyhow::Result<(Arc<Acp>, Option<Child>)> {
+        let a = (self.spawn)().await?;
+        tokio::spawn(self.clone().run_incoming(a.acp.clone(), a.incoming));
+        Ok((a.acp, a.child))
+    }
+
+    fn agent_of(&self, sid: &str) -> Option<Arc<Acp>> {
+        self.agents.lock_ok().get(sid).map(|s| s.acp.clone())
+    }
+
+    /// The session's agent, started (and the session loaded) on first
+    /// use: after a restart of the bridge, or if its agent died. On
+    /// failure, tells the session's chat and forgets the session.
+    async fn agent(self: &Arc<Self>, sid: &str) -> Option<Arc<Acp>> {
+        if let Some(a) = self.agent_of(sid) {
+            return Some(a);
+        }
+        let _one = self.starting.lock().await;
+        if let Some(a) = self.agent_of(sid) {
+            return Some(a);
+        }
+        let s = self.session(sid)?;
+        match self.load(sid, &s.cwd).await {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!(error = %e, session = sid, "session not resumed");
+                self.emit(Out::Notice {
+                    to: s.dest(),
+                    text: self.tr.not_resumed(&e.to_string()),
+                });
+                let mut st = self.state.lock_ok();
+                st.remove(sid);
+                st.save();
+                None
             }
         }
     }
@@ -784,11 +838,10 @@ impl Bridge {
         }
     }
 
-    async fn on_request(self: Arc<Self>, id: Value, method: String, params: Value) {
+    async fn on_request(self: Arc<Self>, acp: Arc<Acp>, id: Value, method: String, params: Value) {
         if method != "session/request_permission" {
             // Nothing else is advertised in clientCapabilities.
-            self.acp
-                .respond_error(id, -32601, &format!("method not supported: {method}"))
+            acp.respond_error(id, -32601, &format!("method not supported: {method}"))
                 .await;
             return;
         }
@@ -796,7 +849,7 @@ impl Bridge {
             Some(option) => json!({"outcome": {"outcome": "selected", "optionId": option}}),
             None => json!({"outcome": {"outcome": "cancelled"}}),
         };
-        self.acp.respond(id, result).await;
+        acp.respond(id, result).await;
     }
 
     /// Permission prompt → buttons; waits like the terminal does. `None`
@@ -894,8 +947,16 @@ impl Bridge {
                 return;
             }
         };
-        let r = self
-            .acp
+        let (acp, child) = match self.start_agent().await {
+            Ok(a) => a,
+            Err(e) => {
+                return self.emit(Out::Notice {
+                    to: origin,
+                    text: self.tr.new_failed(&e.to_string()),
+                });
+            }
+        };
+        let r = acp
             .request(
                 "session/new",
                 // Devin only persists a session after its first prompt:
@@ -933,6 +994,9 @@ impl Bridge {
         } else {
             format!("[{tag}] {}", title_of(&prompt))
         };
+        self.agents
+            .lock_ok()
+            .insert(sid.clone(), Slot { acp, _child: child });
         let dest = self.place(origin, &title).await;
         self.live.lock_ok().insert(sid.clone(), init);
         self.adopt(&sid, &title, &cwd, dest);
@@ -978,8 +1042,9 @@ impl Bridge {
         st.save();
     }
 
-    /// `session/load`, ignoring the replayed history.
-    async fn load(&self, sid: &str, cwd: &str) -> anyhow::Result<()> {
+    /// `session/load` in a new agent, ignoring the replayed history.
+    async fn load(self: &Arc<Self>, sid: &str, cwd: &str) -> anyhow::Result<Arc<Acp>> {
+        let (acp, child) = self.start_agent().await?;
         self.live.lock_ok().insert(
             sid.to_string(),
             Live {
@@ -987,8 +1052,7 @@ impl Bridge {
                 ..Default::default()
             },
         );
-        let r = self
-            .acp
+        let r = acp
             .request(
                 "session/load",
                 json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
@@ -1003,7 +1067,14 @@ impl Bridge {
                     l.apply(&v);
                 }
                 info!(session = sid, "session resumed");
-                Ok(())
+                self.agents.lock_ok().insert(
+                    sid.to_string(),
+                    Slot {
+                        acp: acp.clone(),
+                        _child: child,
+                    },
+                );
+                Ok(acp)
             }
             Err(e) => {
                 live.remove(sid);
@@ -1012,7 +1083,10 @@ impl Bridge {
         }
     }
 
-    async fn prompt(&self, sid: String, text: String) {
+    async fn prompt(self: &Arc<Self>, sid: String, text: String) {
+        let Some(acp) = self.agent(&sid).await else {
+            return;
+        };
         let fresh = {
             let mut live = self.live.lock_ok();
             let Some(l) = live.get_mut(&sid) else { return };
@@ -1029,8 +1103,7 @@ impl Bridge {
                 fresh: true,
             });
         }
-        let r = self
-            .acp
+        let r = acp
             .request(
                 "session/prompt",
                 json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}),
@@ -1074,6 +1147,9 @@ impl Bridge {
 
     /// /model [query]: switch directly on a single match, else buttons.
     async fn model_cmd(self: Arc<Self>, origin: Dest, sid: String, query: String) {
+        if self.agent(&sid).await.is_none() {
+            return;
+        }
         let (models, current) = match self.live.lock_ok().get(&sid) {
             Some(l) => (l.models.clone(), l.model_name()),
             None => (Vec::new(), String::new()),
@@ -1125,16 +1201,18 @@ impl Bridge {
         }
     }
 
-    async fn set_model(&self, sid: &str, model: &str) {
+    async fn set_model(self: &Arc<Self>, sid: &str, model: &str) {
         self.set_config(sid, "model", model).await;
     }
 
     /// `session/set_config_option` (model, thought_level…); the result
     /// carries the updated options.
-    async fn set_config(&self, sid: &str, id: &str, value: &str) {
+    async fn set_config(self: &Arc<Self>, sid: &str, id: &str, value: &str) {
         let model = value;
-        let r = self
-            .acp
+        let Some(acp) = self.agent(sid).await else {
+            return;
+        };
+        let r = acp
             .request(
                 "session/set_config_option",
                 json!({"sessionId": sid, "configId": id, "value": value}),
@@ -1161,9 +1239,11 @@ impl Bridge {
         });
     }
 
-    async fn set_mode(&self, sid: &str, mode: &str) {
-        let r = self
-            .acp
+    async fn set_mode(self: &Arc<Self>, sid: &str, mode: &str) {
+        let Some(acp) = self.agent(sid).await else {
+            return;
+        };
+        let r = acp
             .request(
                 "session/set_mode",
                 json!({"sessionId": sid, "modeId": mode}),
@@ -1194,8 +1274,11 @@ impl Bridge {
                 p.tx.send(None).ok();
             }
         }
-        if let Err(e) = self
-            .acp
+        // No agent: nothing is running.
+        let Some(acp) = self.agent_of(sid) else {
+            return;
+        };
+        if let Err(e) = acp
             .notify("session/cancel", json!({"sessionId": sid}))
             .await
         {
@@ -1473,10 +1556,13 @@ impl Bridge {
                 )
                 .await;
         }
-        self.acp
-            .request("session/close", json!({"sessionId": sid}))
-            .await
-            .ok();
+        if let Some(acp) = self.agent_of(sid) {
+            acp.request("session/close", json!({"sessionId": sid}))
+                .await
+                .ok();
+        }
+        // Drops the slot: stops the session's agent.
+        self.agents.lock_ok().remove(sid);
         self.live.lock_ok().remove(sid);
         let mut st = self.state.lock_ok();
         st.remove(sid);
@@ -1523,7 +1609,7 @@ impl Bridge {
             Some(c) => json!({"cwd": c}),
             None => json!({}),
         };
-        let list = match self.acp.request("session/list", params).await {
+        let list = match self.control.request("session/list", params).await {
             Ok(v) => v["sessions"].as_array().cloned().unwrap_or_default(),
             Err(e) => {
                 return self.emit(Out::Notice {

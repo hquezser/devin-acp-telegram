@@ -2,6 +2,7 @@
 //! (local HTTP server) and a fake ACP agent (in-memory pipe).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::acp::Acp;
+use crate::agent::{Agent, Spawn};
 use crate::bridge::Bridge;
 
 type Queue = Arc<Mutex<VecDeque<Value>>>;
@@ -62,15 +64,51 @@ async fn send(w: &mut (impl tokio::io::AsyncWrite + Unpin), v: Value) {
     w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
 }
 
-/// Fake Devin: each prompt runs a tool that needs permission, then
-/// answers "Done: 200" (or stops on cancel / rejection).
+/// A turn of the fake agent: a tool call that needs permission.
+async fn start_turn(writer: &mut (impl tokio::io::AsyncWrite + Unpin), sid: &str) {
+    let u = json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
+                   "title": "Ran curl", "kind": "execute"});
+    send(
+        writer,
+        json!({"jsonrpc": "2.0", "method": "session/update",
+               "params": {"sessionId": sid, "update": u}}),
+    )
+    .await;
+    send(
+        writer,
+        json!({"jsonrpc": "2.0", "id": "perm", "method": "session/request_permission",
+               "params": {"sessionId": sid,
+                          "toolCall": {"toolCallId": "t1",
+                                       "_meta": {"cognition.ai/editableCommand": "curl -sI example.com"}},
+                          "options": [
+                              {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                              {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}]}}),
+    )
+    .await;
+}
+
+/// Starts the next queued turn, if any.
+async fn next_turn(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    queued: &mut VecDeque<(Value, String)>,
+) -> Option<(Value, String)> {
+    let (id, sid) = queued.pop_front()?;
+    start_turn(writer, &sid).await;
+    Some((id, sid))
+}
+
+/// Fake Devin process: each prompt runs a tool that needs permission,
+/// then answers "Done: 200" (or stops on cancel / rejection). Like the
+/// real one, it runs a single turn at a time. `sessions` numbers the
+/// sessions across all fake processes.
 async fn fake_agent(
     reader: impl tokio::io::AsyncRead + Unpin,
     mut writer: impl tokio::io::AsyncWrite + Unpin,
+    sessions: Arc<AtomicUsize>,
 ) {
     let mut lines = BufReader::new(reader).lines();
-    let mut sessions = 0;
     let mut prompt: Option<(Value, String)> = None;
+    let mut queued: VecDeque<(Value, String)> = VecDeque::new();
     while let Ok(Some(line)) = lines.next_line().await {
         let v: Value = serde_json::from_str(&line).unwrap();
         let id = v["id"].clone();
@@ -81,8 +119,8 @@ async fn fake_agent(
         };
         match v["method"].as_str() {
             Some("session/new") => {
-                sessions += 1;
-                let r = json!({"sessionId": format!("s{sessions}"),
+                let n = sessions.fetch_add(1, Ordering::Relaxed) + 1;
+                let r = json!({"sessionId": format!("s{n}"),
                                "modes": {"currentModeId": "accept-edits"}});
                 send(
                     &mut writer,
@@ -91,27 +129,12 @@ async fn fake_agent(
                 .await;
             }
             Some("session/prompt") => {
-                send(
-                    &mut writer,
-                    update(
-                        &sid,
-                        json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
-                                        "title": "Ran curl", "kind": "execute"}),
-                    ),
-                )
-                .await;
-                send(
-                    &mut writer,
-                    json!({"jsonrpc": "2.0", "id": "perm", "method": "session/request_permission",
-                           "params": {"sessionId": sid,
-                                      "toolCall": {"toolCallId": "t1",
-                                                   "_meta": {"cognition.ai/editableCommand": "curl -sI example.com"}},
-                                      "options": [
-                                          {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
-                                          {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}]}}),
-                )
-                .await;
-                prompt = Some((id, sid));
+                if prompt.is_some() {
+                    queued.push_back((id, sid));
+                } else {
+                    start_turn(&mut writer, &sid).await;
+                    prompt = Some((id, sid));
+                }
             }
             Some("session/cancel") => {
                 if let Some((pid, _)) = prompt.take() {
@@ -121,6 +144,7 @@ async fn fake_agent(
                         json!({"jsonrpc": "2.0", "id": pid, "result": r}),
                     )
                     .await;
+                    prompt = next_turn(&mut writer, &mut queued).await;
                 }
             }
             Some("session/set_mode") => {
@@ -173,9 +197,41 @@ async fn fake_agent(
                     json!({"jsonrpc": "2.0", "id": pid, "result": r}),
                 )
                 .await;
+                prompt = next_turn(&mut writer, &mut queued).await;
             }
         }
     }
+}
+
+/// Starts in-memory fake agents; `started` counts them.
+fn fake_spawn(started: Arc<AtomicUsize>) -> Spawn {
+    let sessions = Arc::new(AtomicUsize::new(0));
+    Arc::new(move || {
+        started.fetch_add(1, Ordering::Relaxed);
+        let (client, agent) = tokio::io::duplex(1 << 16);
+        let (cr, cw) = tokio::io::split(client);
+        let (ar, aw) = tokio::io::split(agent);
+        tokio::spawn(fake_agent(ar, aw, sessions.clone()));
+        let (acp, incoming) = Acp::start(BufReader::new(cr), Box::new(cw));
+        Box::pin(async move {
+            Ok(Agent {
+                acp,
+                incoming,
+                child: None,
+            })
+        })
+    })
+}
+
+async fn start_bridge(
+    cfg: crate::config::Config,
+    spawn: Spawn,
+) -> (Arc<Bridge>, tokio::task::JoinSet<()>) {
+    let control = spawn().await.unwrap();
+    let (bridge, mut tasks) =
+        Bridge::start(cfg, control.acp, control.incoming, spawn, "mac".into());
+    bridge.startup(&mut tasks, None).await;
+    (bridge, tasks)
 }
 
 struct Harness {
@@ -232,13 +288,7 @@ async fn remote_control_round_trip() {
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = crate::config::test_config(&api, dir.clone());
 
-    let (client, agent) = tokio::io::duplex(1 << 16);
-    let (cr, cw) = tokio::io::split(client);
-    let (ar, aw) = tokio::io::split(agent);
-    tokio::spawn(fake_agent(ar, aw));
-    let (acp, incoming) = Acp::start(BufReader::new(cr), Box::new(cw));
-    let (bridge, mut tasks) = Bridge::start(cfg, acp, incoming, "mac".into());
-    bridge.startup(&mut tasks, None).await;
+    let (_bridge, mut tasks) = start_bridge(cfg, fake_spawn(Arc::default())).await;
     let mut h = Harness {
         queue,
         calls,
@@ -341,4 +391,100 @@ async fn remote_control_round_trip() {
     assert_eq!(st.sessions["s2"].thread, Some(77));
     assert!(st.offset > 0);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Two sessions wait for a permission at the same time (one agent each),
+/// and a session left open is reloaded in a new agent after a restart.
+#[tokio::test]
+async fn sessions_run_in_parallel_and_reload_lazily() {
+    let (api, queue, calls) = fake_telegram().await;
+    let dir = std::env::temp_dir().join(format!("dat-e2e-par-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = crate::config::test_config(&api, dir.clone());
+    let started = Arc::new(AtomicUsize::new(0));
+    let (bridge, mut tasks) = start_bridge(cfg.clone(), fake_spawn(started.clone())).await;
+    let mut h = Harness {
+        queue,
+        calls,
+        next_update: 0,
+    };
+    h.expect("sendMessage", |b| text_is(b, "Devin bridge online"))
+        .await;
+
+    h.text(42, 42, "/new first task");
+    h.expect("sendMessage", |b| {
+        text_is(b, "🔐 Allow?") && text_is(b, "first task")
+    })
+    .await;
+    // The first session waits for its tap; the second still runs.
+    h.text(42, 42, "/new second task");
+    h.expect("sendMessage", |b| {
+        text_is(b, "🔐 Allow?") && text_is(b, "second task")
+    })
+    .await;
+    // Control agent + one per session.
+    assert_eq!(started.load(Ordering::Relaxed), 3);
+
+    // Restart: the open sessions get no agent until they are used.
+    tasks.abort_all();
+    bridge.shutdown(None).await;
+    drop(bridge);
+    let started = Arc::new(AtomicUsize::new(0));
+    let (_bridge, _tasks) = start_bridge(cfg, fake_spawn(started.clone())).await;
+    h.expect("sendMessage", |b| text_is(b, "Devin bridge online"))
+        .await;
+    assert_eq!(started.load(Ordering::Relaxed), 1);
+    h.text(42, 42, "again");
+    h.expect("sendMessage", |b| text_is(b, "🔐 Allow?")).await;
+    assert_eq!(started.load(Ordering::Relaxed), 2);
+}
+
+/// With the real Devin CLI: two sessions prompted together finish
+/// together. `cargo test -- --ignored real_devin` (needs `devin` logged in).
+#[tokio::test]
+#[ignore]
+async fn real_devin_sessions_overlap() {
+    let (api, queue, calls) = fake_telegram().await;
+    let dir = std::env::temp_dir().join(format!("dat-e2e-real-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = crate::config::test_config(&api, dir.clone());
+    cfg.cwd = dir.to_string_lossy().into_owned();
+    let (_bridge, _tasks) = start_bridge(cfg.clone(), crate::agent::devin(&cfg)).await;
+    let mut h = Harness {
+        queue,
+        calls,
+        next_update: 0,
+    };
+    h.expect("sendMessage", |b| text_is(b, "Devin bridge online"))
+        .await;
+    let t0 = tokio::time::Instant::now();
+    for topic in ["lighthouses", "volcanoes"] {
+        h.text(
+            42,
+            42,
+            &format!("/new Without using any tool, write 400 words about {topic}."),
+        );
+    }
+    let mut done = Vec::new();
+    while done.len() < 2 {
+        let (m, b) = tokio::time::timeout(Duration::from_secs(180), h.calls.recv())
+            .await
+            .expect("no answer")
+            .unwrap();
+        // Final answers notify; interim text and status are silent.
+        if m == "sendMessage"
+            && b["disable_notification"] == false
+            && b.get("reply_markup").is_none()
+        {
+            let topic = if text_is(&b, "lighthouses") {
+                "lighthouses"
+            } else {
+                "volcanoes"
+            };
+            done.push((topic, t0.elapsed().as_secs_f32()));
+        }
+    }
+    println!("finished: {done:?}");
+    let gap = (done[1].1 - done[0].1).abs();
+    assert!(gap < done[0].1, "turns ran one after another: {done:?}");
 }
